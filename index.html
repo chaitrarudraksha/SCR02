@@ -1,0 +1,464 @@
+<!DOCTYPE html>
+<!--
+# Firing Angle Control Dashboard – Setup Guide
+
+## 1. Create the Firebase project (free Spark plan)
+1. Go to https://console.firebase.google.com → **Add project** (Analytics not needed).
+2. **Build → Realtime Database → Create database**. Pick the region nearest you. Start in *locked mode*.
+3. **Project settings (gear) → Your apps → Web (</>)** → register an app → copy the `firebaseConfig` values.
+4. Open `script.js` and replace every `YOUR_...` placeholder. Make sure `databaseURL` matches the URL shown at the top of the Realtime Database page.
+
+## 2. Database structure
+Create it manually or let the dashboard/ESP32 create it on first write:
+```
+project/
+  control/       systemEnabled (boolean)  firingAngle (number 0-180)
+  measurements/  outputVoltage (number)   frequency (number)
+  status/        esp32Online (boolean)  scr1Status  scr2Status  lastUpdate
+```
+Import this JSON (three-dot menu → Import JSON) to seed it safely OFF:
+```json
+{"project":{"control":{"systemEnabled":false,"firingAngle":180},
+"measurements":{"outputVoltage":0,"frequency":50},
+"status":{"esp32Online":false,"scr1Status":"Idle","scr2Status":"Idle","lastUpdate":0}}}
+```
+
+## 3. Security rules (Realtime Database → Rules)
+The dashboard signs in anonymously, so enable **Authentication → Sign-in method → Anonymous**. Then:
+```json
+{
+  "rules": {
+    "project": {
+      ".read": "auth != null",
+      "control": {
+        ".write": "auth != null",
+        "firingAngle": {".validate": "newData.isNumber() && newData.val() >= 0 && newData.val() <= 180"},
+        "systemEnabled": {".validate": "newData.isBoolean()"}
+      },
+      "measurements": {".write": "auth != null"},
+      "status": {".write": "auth != null"}
+    }
+  }
+}
+```
+Create a second user (**Authentication → Email/Password**) for the ESP32 so you can later restrict `measurements` and `status` writes to that user's `uid`. Do not leave the database in open test mode.
+
+## 4. ESP32 connection
+Use the Arduino library **Firebase ESP Client** by Mobizt (Library Manager) and the board package for ESP32.
+- Connect to Wi-Fi, sign in with the ESP32 email/password user, set `API_KEY` and `DATABASE_URL`.
+- **Read** `/project/control/systemEnabled` and `/project/control/firingAngle` (use a stream or poll every 200-500 ms).
+- **Write every 1-2 s**: `/project/measurements/outputVoltage`, `/project/measurements/frequency`, `/project/status/esp32Online` = true, `scr1Status`, `scr2Status`, and `lastUpdate`.
+- `lastUpdate` must **change on every write** (use `millis()` or an NTP epoch). The dashboard marks the ESP32 offline if it stops changing for 15 s, so a crashed ESP32 is detected even though it cannot clear its own flag.
+- Optional: set an `onDisconnect` style safety on the ESP32 by firing nothing if Wi-Fi/Firebase is lost for several seconds.
+
+Minimal skeleton:
+```cpp
+#include <WiFi.h>
+#include <Firebase_ESP_Client.h>
+FirebaseData fbdo; FirebaseAuth auth; FirebaseConfig config;
+void setup(){
+  WiFi.begin("SSID","PASS"); while(WiFi.status()!=WL_CONNECTED) delay(300);
+  config.api_key="YOUR_API_KEY"; config.database_url="YOUR_DATABASE_URL";
+  auth.user.email="esp32@example.com"; auth.user.password="YOUR_PASSWORD";
+  Firebase.begin(&config,&auth); Firebase.reconnectWiFi(true);
+}
+void loop(){
+  static uint32_t t=0; if(millis()-t>1000){ t=millis();
+    bool en; int a;
+    if(Firebase.RTDB.getBool(&fbdo,"/project/control/systemEnabled")) en=fbdo.boolData();
+    if(Firebase.RTDB.getInt(&fbdo,"/project/control/firingAngle")) a=fbdo.intData();
+    // delay_us = a / (180.0*2*f) * 1e6  -> start timer after zero-cross interrupt, then pulse SCR gate
+    Firebase.RTDB.setFloat(&fbdo,"/project/measurements/outputVoltage", /* your ADC value */ 0);
+    Firebase.RTDB.setFloat(&fbdo,"/project/measurements/frequency", /* measured */ 50);
+    Firebase.RTDB.setBool(&fbdo,"/project/status/esp32Online",true);
+    Firebase.RTDB.setInt(&fbdo,"/project/status/lastUpdate",millis());
+  }
+}
+```
+Keep the gate-firing logic in a zero-cross interrupt plus hardware timer, not in `loop()`. Firebase calls are too slow for timing. Use an optocoupler or pulse-transformer for isolation, and an isolated, scaled voltage sensor only.
+
+## 5. Deploy on Firebase Hosting (free)
+```
+npm install -g firebase-tools
+firebase login
+cd firing-dashboard
+firebase init hosting     # choose your project, public directory ".", single-page app: No
+                          # do NOT overwrite index.html
+firebase deploy --only hosting
+```
+Before deploying, add `README.md` to the `ignore` list in `firebase.json`. Your site will be at `https://YOUR_PROJECT_ID.web.app`. To test locally first: `firebase serve` or open `index.html` through any local web server.
+
+## Safety notes
+- The STOP button writes `systemEnabled=false` and `firingAngle=180`. It depends on Wi-Fi, Firebase and the ESP32 firmware, so it is **not** a substitute for a physical emergency stop, fuse or isolation switch.
+- Dashboard shows measurements and SCR status only while the ESP32 is verified online.
+- Test with a low-voltage AC source and isolation transformer before using mains.
+
+-->
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Firing Angle Control Dashboard</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Barlow:wght@400;500;600&family=Barlow+Condensed:wght@500;600;700&display=swap" rel="stylesheet">
+<style>
+:root{--n9:#07142b;--n8:#0c1f3f;--n7:#13305f;--line:#25457a;--white:#fff;--ice:#c9dcff;--blue:#4da3ff;--ok:#3ddc97;--warn:#ffb547;--bad:#ff5d6c;--ink:#0c1f3f}
+*{box-sizing:border-box}
+html{scroll-behavior:smooth}
+body{margin:0;background:var(--n9);color:var(--white);font:16px/1.5 Barlow,system-ui,-apple-system,"Segoe UI",Roboto,sans-serif}
+h1,h2{font-family:"Barlow Condensed",Barlow,sans-serif;margin:0}
+h1{font-size:clamp(1.5rem,4vw,2.2rem);font-weight:700;letter-spacing:.01em}
+h2{font-size:1.3rem;font-weight:600;margin:.4rem 0 .8rem}
+.top{display:flex;flex-wrap:wrap;gap:12px;justify-content:space-between;align-items:center;padding:18px clamp(14px,4vw,32px);background:var(--n8);border-bottom:2px solid var(--blue)}
+.sub{margin:2px 0 0;color:var(--ice);font-size:.95rem}
+.pills{display:flex;gap:8px;flex-wrap:wrap}
+.pill{display:inline-flex;align-items:center;gap:8px;padding:6px 12px;border:1px solid var(--line);border-radius:999px;background:var(--n7);font-size:.9rem}
+.pill i{width:10px;height:10px;border-radius:50%;background:var(--warn)}
+.pill.ok i{background:var(--ok)}.pill.bad i{background:var(--bad)}
+.tabs{display:flex;gap:4px;overflow-x:auto;padding:8px clamp(14px,4vw,32px);background:var(--n8);position:sticky;top:0;z-index:5;border-bottom:1px solid var(--line)}
+.tabs a{color:var(--ice);text-decoration:none;padding:6px 14px;border-radius:6px;white-space:nowrap}
+.tabs a:hover,.tabs a:focus-visible{background:var(--n7);color:var(--white)}
+.banner{margin:14px clamp(14px,4vw,32px) 0;padding:12px 16px;border-radius:8px;background:#3a2a00;border:1px solid var(--warn);color:#ffe2ad}
+.banner.bad{background:#3d1119;border-color:var(--bad);color:#ffd0d5}
+main{display:grid;grid-template-columns:repeat(auto-fit,minmax(min(100%,420px),1fr));gap:16px;padding:16px clamp(14px,4vw,32px) 24px;max-width:1300px;margin:0 auto}
+.panel{background:var(--n8);border:1px solid var(--line);border-radius:10px;padding:18px;scroll-margin-top:60px;min-width:0}
+.wide{grid-column:1/-1}
+.row{display:flex;gap:10px;flex-wrap:wrap;align-items:center}
+.btn{font:600 1rem Barlow,sans-serif;padding:10px 18px;border-radius:8px;border:1px solid var(--blue);background:transparent;color:var(--white);cursor:pointer;min-height:44px}
+.btn:hover{background:var(--n7)}
+.btn:focus-visible,input:focus-visible,a:focus-visible{outline:3px solid var(--white);outline-offset:2px}
+.btn.primary{background:var(--blue);color:var(--n9);border-color:var(--blue)}
+.btn.primary:hover{background:#7bbbff}
+.btn.big{flex:1 1 180px;font-size:1.1rem}
+.btn.on{background:var(--ok);border-color:var(--ok);color:var(--n9)}
+.btn.stop{background:var(--bad);border-color:var(--bad);color:var(--n9);font-weight:700}
+.btn.stop:hover{background:#ff8591}
+.btn:disabled{opacity:.45;cursor:not-allowed}
+.note{color:var(--ice);font-size:.9rem;margin:.6rem 0 1rem}
+label{display:block;margin-bottom:6px;color:var(--ice);font-size:.9rem}
+input[type=number]{width:110px;padding:10px;font:600 1.2rem Barlow,sans-serif;border-radius:8px;border:1px solid var(--line);background:var(--n9);color:var(--white)}
+input[type=number].invalid{border-color:var(--bad)}
+input[type=range]{width:100%;margin:16px 0;accent-color:var(--blue);height:28px}
+.angle{display:grid;grid-template-columns:repeat(auto-fit,minmax(min(100%,240px),1fr));gap:16px;align-items:start}
+#wave,#chart{width:100%;height:auto;background:var(--n9);border:1px solid var(--line);border-radius:8px;display:block}
+.kv{display:grid;grid-template-columns:auto 1fr;gap:6px 14px;margin:8px 0 0}
+.kv dt{color:var(--ice)}.kv dd{margin:0;font-weight:600}
+.tiles{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:12px}
+.tile{background:var(--white);color:var(--ink);border-radius:8px;padding:14px;display:flex;flex-direction:column}
+.tile span{font-size:.9rem;color:#3c5a8c}
+.tile strong{font:700 2.3rem/1.1 "Barlow Condensed",sans-serif}
+.tile em{font-style:normal;color:#3c5a8c}
+.scr{display:grid;grid-template-columns:1fr 1fr;gap:12px}
+.scr-box{border:2px solid var(--line);border-radius:8px;padding:14px;background:var(--n9)}
+.scr-box span{display:block;color:var(--ice)}
+.scr-box strong{font:700 1.6rem "Barlow Condensed",sans-serif}
+.scr-box.active{border-color:var(--ok)}.scr-box.active strong{color:var(--ok)}
+footer{padding:16px;text-align:center;color:var(--ice);font-size:.85rem;border-top:1px solid var(--line)}
+@media (prefers-reduced-motion:reduce){html{scroll-behavior:auto}}
+</style>
+</head>
+<body>
+<header class="top">
+  <div>
+    <h1>Digital Firing Angle Control</h1>
+    <p class="sub">Single-phase full-wave controlled rectifier · ESP32 · Firebase</p>
+  </div>
+  <div class="pills">
+    <span class="pill" id="netPill"><i></i><b>Firebase: connecting</b></span>
+    <span class="pill" id="espPill"><i></i><b>ESP32: unknown</b></span>
+  </div>
+</header>
+
+<nav class="tabs" aria-label="Sections">
+  <a href="#control">Control</a><a href="#measure">Measurements</a><a href="#scr">SCR</a><a href="#graph">Graph</a>
+</nav>
+
+<div id="banner" class="banner" role="alert" hidden></div>
+
+<main>
+  <section id="control" class="panel">
+    <h2>System control</h2>
+    <div class="row">
+      <button id="sysBtn" class="btn big" type="button">System: --</button>
+      <button id="stopBtn" class="btn stop big" type="button">EMERGENCY STOP</button>
+    </div>
+    <p class="note" id="sysNote">Commanded state is what the dashboard has written. It does not confirm the converter is running.</p>
+
+    <h2>Firing angle (α)</h2>
+    <div class="angle">
+      <div class="angle-in">
+        <label for="angleNum">Angle, degrees (0–180)</label>
+        <div class="row">
+          <input id="angleNum" type="number" min="0" max="180" step="1" inputmode="numeric" value="90">
+          <button id="applyBtn" class="btn primary" type="button">Apply angle</button>
+        </div>
+        <input id="angleRange" type="range" min="0" max="180" step="1" value="90" aria-label="Firing angle slider">
+        <dl class="kv">
+          <dt>Pending value</dt><dd><span id="pendingAngle">90</span>°</dd>
+          <dt>Calculated delay Td</dt><dd><span id="delayCalc">--</span> ms</dd>
+          <dt>Supply frequency used</dt><dd><span id="fUsed">50</span> Hz <small id="fSrc">(assumed)</small></dd>
+        </dl>
+      </div>
+      <canvas id="wave" width="560" height="220" aria-label="Rectified waveform with firing angle"></canvas>
+    </div>
+  </section>
+
+  <section id="measure" class="panel">
+    <h2>Electrical measurements</h2>
+    <div class="tiles">
+      <div class="tile"><span>DC output voltage</span><strong id="mV">--</strong><em>V</em></div>
+      <div class="tile"><span>AC supply frequency</span><strong id="mF">--</strong><em>Hz</em></div>
+      <div class="tile"><span>Selected firing angle</span><strong id="mA">--</strong><em>°</em></div>
+      <div class="tile"><span>Firing delay</span><strong id="mD">--</strong><em>ms</em></div>
+    </div>
+    <p class="note">Voltage and frequency are shown only while the ESP32 reports online.</p>
+  </section>
+
+  <section id="scr" class="panel">
+    <h2>SCR monitoring</h2>
+    <div class="scr">
+      <div class="scr-box" id="scr1"><span>SCR 1</span><strong>--</strong></div>
+      <div class="scr-box" id="scr2"><span>SCR 2</span><strong>--</strong></div>
+    </div>
+    <dl class="kv">
+      <dt>Last update from ESP32</dt><dd id="lastUpdate">--</dd>
+      <dt>Seconds since last update</dt><dd id="lastAge">--</dd>
+    </dl>
+  </section>
+
+  <section id="graph" class="panel wide">
+    <h2>DC output voltage vs time</h2>
+    <canvas id="chart" width="1000" height="300" aria-label="Live DC output voltage graph"></canvas>
+  </section>
+</main>
+
+<footer>Software controls do not replace hardware isolation, fuses or a physical emergency stop.</footer>
+
+<script src="https://www.gstatic.com/firebasejs/10.12.2/firebase-app-compat.js"></script>
+<script src="https://www.gstatic.com/firebasejs/10.12.2/firebase-auth-compat.js"></script>
+<script src="https://www.gstatic.com/firebasejs/10.12.2/firebase-database-compat.js"></script>
+<script>
+/* ===== 1. PASTE YOUR OWN FIREBASE CONFIG HERE (Project settings > Your apps > Web) ===== */
+const firebaseConfig = {
+  apiKey: "AIzaSyBfqMgeoFoB2WDisjnAHkQwOCFwekXRpUk",
+  authDomain: "scr01-60edb.firebaseapp.com",
+  databaseURL: "https://scr01-60edb-default-rtdb.firebaseio.com",
+  projectId: "scr01-60edb",
+  appId: "1:568998394391:web:0755d53f7638e0b99f3a52"
+};
+
+const STALE_MS = 15000;      // ESP32 is treated as offline if lastUpdate does not change for this long
+const DEFAULT_F = 50;        // used only until the ESP32 reports a frequency
+const MAX_POINTS = 90;
+
+const $ = id => document.getElementById(id);
+const state = { sys: null, angleDb: null, v: null, f: null, esp32Flag: false,
+  scr1: null, scr2: null, lastUpdate: null, lastChange: 0, fbOnline: false, points: [] };
+
+function banner(msg, level) {
+  const b = $("banner");
+  if (!msg) { b.hidden = true; return; }
+  b.textContent = msg; b.className = "banner" + (level === "bad" ? " bad" : ""); b.hidden = false;
+}
+
+/* ---------- Validation ---------- */
+function parseAngle(raw) {
+  const s = String(raw).trim();
+  if (!/^\d{1,3}$/.test(s)) return null;      // whole numbers only
+  const n = Number(s);
+  return n >= 0 && n <= 180 ? n : null;
+}
+const freqNow = () => (state.f && state.f >= 40 && state.f <= 70) ? state.f : DEFAULT_F;
+const delayMs = (a, f) => (a / (180 * 2 * f)) * 1000;   // Td = α / (180 × 2 × f)
+
+/* ---------- Firebase init ---------- */
+let db = null;
+if (firebaseConfig.apiKey.startsWith("YOUR_")) {
+  banner("Firebase is not configured. Open script.js and paste your own firebaseConfig.", "bad");
+  setPill("netPill", "bad", "Firebase: not configured");
+} else {
+  try {
+    firebase.initializeApp(firebaseConfig);
+    db = firebase.database();
+    firebase.auth().signInAnonymously().catch(e => {
+      // Fine if your rules are open for testing; otherwise enable Anonymous sign-in.
+      console.warn("Anonymous sign-in failed:", e.code);
+      banner("Sign-in failed (" + e.code + "). Enable Anonymous sign-in in Firebase Authentication or use test-mode rules.", "bad");
+    });
+    start();
+  } catch (e) { banner("Firebase error: " + e.message, "bad"); }
+}
+
+function setPill(id, cls, text) {
+  const p = $(id); p.className = "pill " + cls; p.querySelector("b").textContent = text;
+}
+
+function start() {
+  const ref = p => db.ref("project/" + p);
+
+  db.ref(".info/connected").on("value", s => {
+    state.fbOnline = s.val() === true;
+    setPill("netPill", state.fbOnline ? "ok" : "bad", state.fbOnline ? "Firebase: connected" : "Firebase: disconnected");
+    if (!state.fbOnline) banner("No connection to Firebase. Check your internet. Commands will not reach the ESP32.", "bad");
+    else if ($("banner").classList.contains("bad")) banner("");
+    render();
+  });
+
+  const onErr = e => banner("Firebase read error: " + e.message, "bad");
+
+  ref("control").on("value", s => {
+    const v = s.val() || {};
+    state.sys = typeof v.systemEnabled === "boolean" ? v.systemEnabled : null;
+    state.angleDb = Number.isFinite(v.firingAngle) ? v.firingAngle : null;
+    if (state.angleDb !== null && document.activeElement !== $("angleNum")) setAngleInputs(state.angleDb);
+    render();
+  }, onErr);
+
+  ref("measurements").on("value", s => {
+    const v = s.val() || {};
+    state.v = Number.isFinite(v.outputVoltage) ? v.outputVoltage : null;
+    state.f = Number.isFinite(v.frequency) ? v.frequency : null;
+    render();
+  }, onErr);
+
+  ref("status").on("value", s => {
+    const v = s.val() || {};
+    state.esp32Flag = v.esp32Online === true;
+    state.scr1 = v.scr1Status ?? null;
+    state.scr2 = v.scr2Status ?? null;
+    if (v.lastUpdate !== state.lastUpdate) { state.lastUpdate = v.lastUpdate ?? null; state.lastChange = Date.now(); }
+    render();
+  }, onErr);
+
+  setInterval(() => { sample(); render(); }, 1000);
+}
+
+/* ESP32 counts as online only if it says so AND its lastUpdate is still changing */
+const espOnline = () => state.fbOnline && state.esp32Flag && (Date.now() - state.lastChange) < STALE_MS;
+
+/* ---------- Commands ---------- */
+function write(update, okMsg) {
+  if (!db) return banner("Firebase is not configured.", "bad");
+  db.ref("project/control").update(update)
+    .then(() => { if (okMsg) banner(okMsg); setTimeout(() => { if ($("banner").textContent === okMsg) banner(""); }, 3000); })
+    .catch(e => banner("Write failed: " + e.message, "bad"));
+}
+
+$("sysBtn").onclick = () => {
+  if (state.sys === null) return banner("System state not available from Firebase yet.", "bad");
+  write({ systemEnabled: !state.sys });
+};
+
+$("stopBtn").onclick = () => {
+  // Disable converter and move to 180° (zero output) in one atomic update
+  write({ systemEnabled: false, firingAngle: 180 }, "STOP command sent. Wait for ESP32 to confirm.");
+};
+
+$("applyBtn").onclick = () => {
+  const a = parseAngle($("angleNum").value);
+  if (a === null) { $("angleNum").classList.add("invalid"); return banner("Invalid angle. Enter a whole number from 0 to 180.", "bad"); }
+  $("angleNum").classList.remove("invalid");
+  write({ firingAngle: a }, "Firing angle " + a + "° sent.");
+};
+
+function setAngleInputs(a) { $("angleNum").value = a; $("angleRange").value = a; $("angleNum").classList.remove("invalid"); render(); }
+$("angleRange").oninput = e => setAngleInputs(e.target.value);
+$("angleNum").oninput = e => {
+  const a = parseAngle(e.target.value);
+  e.target.classList.toggle("invalid", a === null);
+  if (a !== null) { $("angleRange").value = a; render(); }
+};
+
+/* ---------- Rendering ---------- */
+const fmt = (v, d = 1) => v === null || v === undefined ? "--" : Number(v).toFixed(d);
+
+function render() {
+  const online = espOnline();
+  setPill("espPill", online ? "ok" : "bad", online ? "ESP32: online" : "ESP32: offline");
+
+  if (db && state.fbOnline && !online) banner("ESP32 is offline or not reporting. Commands are stored but nothing confirms the converter is responding.");
+  else if (online && !$("banner").classList.contains("bad")) banner("");
+
+  const sb = $("sysBtn");
+  sb.textContent = state.sys === null ? "System: --" : "System command: " + (state.sys ? "ON (tap to turn OFF)" : "OFF (tap to turn ON)");
+  sb.classList.toggle("on", state.sys === true);
+  $("sysNote").textContent = online
+    ? "ESP32 is reporting. Commanded state: " + (state.sys ? "ON" : "OFF") + "."
+    : "Commanded state: " + (state.sys === null ? "unknown" : state.sys ? "ON" : "OFF") + ". ESP32 is not reporting, so actual operation is unknown.";
+
+  const pending = parseAngle($("angleNum").value);
+  const f = freqNow();
+  $("pendingAngle").textContent = pending === null ? "invalid" : pending;
+  $("delayCalc").textContent = pending === null ? "--" : delayMs(pending, f).toFixed(3);
+  $("fUsed").textContent = f; $("fSrc").textContent = state.f ? "(measured)" : "(assumed)";
+  $("applyBtn").disabled = pending === null || !state.fbOnline;
+
+  $("mV").textContent = online ? fmt(state.v, 1) : "--";
+  $("mF").textContent = online ? fmt(state.f, 2) : "--";
+  $("mA").textContent = state.angleDb === null ? "--" : state.angleDb;
+  $("mD").textContent = state.angleDb === null ? "--" : delayMs(state.angleDb, f).toFixed(3);
+
+  [["scr1", state.scr1], ["scr2", state.scr2]].forEach(([id, val]) => {
+    const box = $(id), txt = online && val !== null ? (typeof val === "boolean" ? (val ? "Triggered" : "Idle") : String(val)) : "No data";
+    box.querySelector("strong").textContent = txt;
+    box.classList.toggle("active", online && (val === true || /trig|fire|on/i.test(String(val))));
+  });
+
+  const lu = state.lastUpdate;
+  $("lastUpdate").textContent = lu === null ? "--" : (typeof lu === "number" && lu > 1e12 ? new Date(lu).toLocaleString() : String(lu));
+  $("lastAge").textContent = state.lastChange ? Math.round((Date.now() - state.lastChange) / 1000) + " s" : "--";
+
+  drawWave(pending === null ? (state.angleDb ?? 0) : pending);
+  drawChart();
+}
+
+function sample() {
+  if (espOnline() && state.v !== null) {
+    state.points.push({ t: Date.now(), v: state.v });
+    if (state.points.length > MAX_POINTS) state.points.shift();
+  }
+}
+
+/* ---------- Canvas drawing ---------- */
+function drawWave(alpha) {
+  const c = $("wave"), g = c.getContext("2d"), W = c.width, H = c.height, pad = 24;
+  g.clearRect(0, 0, W, H);
+  const x = th => pad + (th / 360) * (W - 2 * pad), y = v => H - pad - v * (H - 2 * pad - 10);
+  // conduction regions (alpha..180 and 180+alpha..360)
+  g.fillStyle = "rgba(77,163,255,.35)";
+  [0, 180].forEach(o => {
+    g.beginPath(); g.moveTo(x(o + alpha), y(0));
+    for (let t = o + alpha; t <= o + 180; t += 2) g.lineTo(x(t), y(Math.abs(Math.sin(t * Math.PI / 180))));
+    g.lineTo(x(o + 180), y(0)); g.closePath(); g.fill();
+  });
+  g.strokeStyle = "#c9dcff"; g.lineWidth = 2; g.beginPath();
+  for (let t = 0; t <= 360; t += 2) { const px = x(t), py = y(Math.abs(Math.sin(t * Math.PI / 180))); t ? g.lineTo(px, py) : g.moveTo(px, py); }
+  g.stroke();
+  g.strokeStyle = "#25457a"; g.lineWidth = 1; g.beginPath(); g.moveTo(pad, y(0)); g.lineTo(W - pad, y(0)); g.stroke();
+  g.strokeStyle = "#ffb547"; g.setLineDash([5, 4]);
+  [alpha, 180 + alpha].forEach(t => { g.beginPath(); g.moveTo(x(t), y(0)); g.lineTo(x(t), 8); g.stroke(); });
+  g.setLineDash([]); g.fillStyle = "#ffb547"; g.font = "600 15px Barlow, sans-serif";
+  g.fillText("α = " + alpha + "°", Math.min(x(alpha) + 6, W - 80), 20);
+  g.fillStyle = "#c9dcff"; g.fillText("shaded: conduction", pad, H - 6);
+}
+
+function drawChart() {
+  const c = $("chart"), g = c.getContext("2d"), W = c.width, H = c.height, L = 56, B = 28, T = 14, R = 14;
+  g.clearRect(0, 0, W, H); g.font = "14px Barlow, sans-serif"; g.fillStyle = "#c9dcff";
+  const pts = state.points;
+  if (pts.length < 2) { g.fillText("Waiting for live data from an online ESP32…", L + 10, H / 2); return; }
+  const vmax = Math.max(10, ...pts.map(p => p.v)) * 1.1, vmin = Math.min(0, ...pts.map(p => p.v));
+  const t0 = pts[0].t, t1 = pts[pts.length - 1].t, span = Math.max(1, t1 - t0);
+  const X = t => L + (t - t0) / span * (W - L - R), Y = v => H - B - (v - vmin) / (vmax - vmin) * (H - B - T);
+  g.strokeStyle = "#25457a"; g.lineWidth = 1;
+  for (let i = 0; i <= 4; i++) { const v = vmin + (vmax - vmin) * i / 4; g.beginPath(); g.moveTo(L, Y(v)); g.lineTo(W - R, Y(v)); g.stroke(); g.fillText(v.toFixed(0) + " V", 6, Y(v) + 5); }
+  g.fillText("-" + Math.round(span / 1000) + " s", L, H - 8); g.fillText("now", W - R - 28, H - 8);
+  g.strokeStyle = "#4da3ff"; g.lineWidth = 2.5; g.beginPath();
+  pts.forEach((p, i) => i ? g.lineTo(X(p.t), Y(p.v)) : g.moveTo(X(p.t), Y(p.v))); g.stroke();
+}
+
+render();
+</script>
+</body>
+</html>
